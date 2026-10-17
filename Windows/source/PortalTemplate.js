@@ -1,0 +1,179 @@
+(() => {
+  const cfg = /*CAMPUS_CONFIG*/;
+  if (location.origin !== cfg.origin) return 'wrong-origin';
+  const outcome = window.__campusSubmitAttempt?.result;
+  const successPage = location.pathname === '/eportal/success.jsp' &&
+    !!new URLSearchParams(location.search).get('userIndex');
+  if (successPage || outcome === 'success') return 'authenticated';
+  if (outcome === 'fail') return 'authentication-rejected';
+  if (cfg.statusOnly) return window.__campusSubmitted ? 'awaiting-authentication' : 'not-submitted';
+  const pending = cfg.confirmSubmit && window.__campusSubmitAttempt;
+  if (pending && pending.failed) return 'submission-unconfirmed';
+  if (window.__campusSubmitted) return 'already-submitted';
+  if (pending && pending.handlerStarted) {
+    if (pending.failed || Date.now() - pending.startedAt >= 8000) return 'submission-unconfirmed';
+    return 'waiting-submit';
+  }
+  if (document.readyState === 'loading') return 'waiting-ready';
+  const ready = window.__campusReady;
+  if (ready && (ready.failed || !ready.pageInfo || !ready.getServices)) return 'waiting-ready';
+  const visible = e => e && !e.disabled && e.getClientRects().length > 0;
+  const editable = e => e instanceof HTMLInputElement && !e.disabled && !e.readOnly;
+  let user, pass, submit, portalUser, portalPass, portalButton;
+  const tipFor = input => input === portalUser ? document.querySelector('#username_tip') :
+    input === portalPass ? document.querySelector('#pwd_tip') : null;
+  const available = input => editable(input) && (visible(input) ||
+    (portalButton && visible(tipFor(input))));
+  try {
+    // Ruijie ePortal displays readonly tips over hidden real inputs. Its login
+    // control is an image-only anchor, so text/button heuristics cannot find it.
+    portalUser = document.querySelector('#username');
+    portalPass = document.querySelector('#pwd');
+    portalButton = document.querySelector('#loginLink');
+    if (!editable(portalUser) || portalUser.type !== 'text' ||
+        !editable(portalPass) || portalPass.type !== 'password' || !portalButton) {
+      portalUser = portalPass = portalButton = null;
+    }
+    // Unknown ePortal variants retain full-load behavior; only inspected initialization is accelerated.
+    if (portalButton && !ready && document.readyState !== 'complete') return 'waiting-ready';
+    pass = cfg.passwordSelector ? document.querySelector(cfg.passwordSelector) :
+      portalPass || [...document.querySelectorAll('input[type="password"]')].find(e => editable(e) && visible(e));
+    const root = pass && pass.form ? pass.form : document;
+    user = cfg.userSelector ? document.querySelector(cfg.userSelector) : portalUser ||
+      [...root.querySelectorAll('input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])')]
+      .filter(e => editable(e) && visible(e)).find(e => /user|account|student|phone|login|学号|账号|手机/i.test([e.name,e.id,e.placeholder,e.autocomplete].join(' ')));
+    if (!user && !cfg.userSelector) user = [...root.querySelectorAll('input[type="text"],input[type="tel"],input[type="email"],input:not([type])')].find(e => editable(e) && visible(e));
+    submit = cfg.submitSelector ? document.querySelector(cfg.submitSelector) : portalButton ||
+      [...root.querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]')].filter(visible)
+        .find(e => e.type === 'submit' || /^(登录|登陆|认证|连接|login|log in|sign in|connect)(\s*(login|登录|登陆))?$/i.test((e.innerText || e.value || '').trim()));
+  } catch (_) { return 'invalid-selector'; }
+  if (!available(user) || !available(pass)) return 'missing-fields';
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+  for (const [input, value] of [[user,cfg.username],[pass,cfg.password]]) {
+    if (!visible(input)) {
+      const tip = tipFor(input);
+      if (visible(tip)) {
+        tip.focus();
+        // Background WebViews may not deliver native focus. Invoke the school's
+        // own reveal handlers without taking OS focus or changing its DOM styles.
+        if (!visible(input) && visible(tip)) tip.dispatchEvent(new FocusEvent('focus'));
+        if (!visible(input) && visible(tip)) tip.dispatchEvent(new FocusEvent('focusin', {bubbles:true}));
+        if (!visible(input) && visible(tip)) tip.click();
+      }
+    }
+    if (!editable(input) || !visible(input)) return 'missing-fields';
+    if (!cfg.confirmSubmit || input.value !== value) {
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', {bubbles:true}));
+      input.dispatchEvent(new Event('change', {bubbles:true}));
+    }
+  }
+  const serviceName = (cfg.serviceOption || '').trim();
+  if (serviceName) {
+    const normalized = text => (text || '').trim();
+    const serviceValue = document.querySelector('#net_access_type');
+    const serviceLabel = document.querySelector('#selectDisname');
+    if (portalButton && serviceValue && serviceLabel && !(serviceValue instanceof HTMLSelectElement)) {
+      // Use the school's existing menu click handlers, including domain/operator updates.
+      // Opening the menu can lazily fetch services for the account just filled above.
+      if (normalized(serviceLabel.textContent) !== serviceName || !serviceValue.value) {
+        const opener = document.querySelector('#serviceShowHideTop');
+        const opened = window.__campusServiceMenus ||= new WeakMap();
+        if (visible(opener) && opened.get(opener) !== cfg.username) {
+          opened.set(opener, cfg.username);
+          opener.click();
+        }
+        const choices = [...document.querySelectorAll('#serviceShowHide [id^="bch_service_"]')]
+          .filter(row => visible(row) && row.getAttribute('aria-disabled') !== 'true' &&
+            normalized((row.querySelector('[id^="_service_"]') || row).textContent) === serviceName);
+        if (choices.length !== 1) return 'missing-service';
+        choices[0].click();
+        if (normalized(serviceLabel.textContent) !== serviceName || !serviceValue.value) return 'missing-service';
+      }
+    } else {
+      const root = pass.form || document;
+      const choices = [...root.querySelectorAll('select')].filter(select => visible(select) && !select.multiple)
+        .flatMap(select => [...select.options].filter(option => !option.disabled &&
+          !(option.parentElement instanceof HTMLOptGroupElement && option.parentElement.disabled) &&
+          normalized(option.textContent) === serviceName).map(option => ({select, option})));
+      if (choices.length !== 1) return 'missing-service';
+      const {select, option} = choices[0];
+      if (select.selectedIndex !== option.index) {
+        select.selectedIndex = option.index;
+        select.dispatchEvent(new Event('input', {bubbles:true}));
+        select.dispatchEvent(new Event('change', {bubbles:true}));
+      }
+      if (select.selectedOptions[0] !== option || select.disabled) return 'missing-service';
+    }
+  }
+  /*CAMPUS_AGREEMENTS*/
+  // School handlers can reject/reset a value; never report success or submit it.
+  if (!editable(user) || !editable(pass) || !visible(user) || !visible(pass) ||
+      user.value !== cfg.username || pass.value !== cfg.password) return 'missing-fields';
+  if (!cfg.submit) return 'filled';
+  if (!visible(submit)) return 'missing-submit';
+  if (portalButton && /doauthen/.test(submit.getAttribute('onclick') || '') &&
+      typeof window.doauthen !== 'function') return 'waiting-ready';
+  // Captchas and extra operator fields need the user's input; don't burn a login attempt.
+  if (portalButton && ['#validCode','#operatorUserId','#operatorPwd'].some(selector => {
+    const input = document.querySelector(selector);
+    return visible(input) && !input.value.trim();
+  })) return 'manual-required';
+  // WKWebView can finish filling before the page handles its first activation.
+  // Observe only the known school's own login flow; never call its API ourselves.
+  if (cfg.confirmSubmit && submit === portalButton && /doauthen/.test(submit.getAttribute('onclick') || '')) {
+    if (typeof window.AuthInterFace?.login !== 'function') return 'waiting-ready';
+    const state = window.__campusSubmitAttempt ||= {clicks:0, prepared:false, handlerStarted:false, failed:false};
+    const observe = (owner, key, flag) => {
+      if (owner[key] === state[key]) return;
+      const original = owner[key];
+      const wrapped = function(...args) {
+        if (flag === 'login') {
+          window.__campusSubmitted = true;
+          // Observe the school's response without replacing its request or callback.
+          const last = args.length - 1;
+          if (typeof args[last] === 'function') {
+            const callback = args[last];
+            args[last] = function(result, ...rest) {
+              if (result?.result === 'success') state.result = 'success';
+              else if (result?.result === 'fail') state.result = 'fail';
+              return callback.call(this, result, ...rest);
+            };
+          }
+        }
+        else { state.handlerStarted = true; state.startedAt = Date.now(); }
+        try { return original.apply(this, args); }
+        catch (error) { state.failed = true; throw error; }
+      };
+      state[key] = wrapped; owner[key] = wrapped;
+    };
+    observe(window, 'doauthen', 'handler');
+    observe(window.AuthInterFace, 'login', 'login');
+    if (!state.prepared || state.button !== submit || state.user !== user || state.pass !== pass) {
+      state.prepared = true; state.button = submit; state.user = user; state.pass = pass;
+      if (document.activeElement === user || document.activeElement === pass) document.activeElement.blur();
+      submit.focus();
+      // Let blur/change handlers and layout finish before rechecking the values.
+      return 'waiting-submit';
+    }
+    if (state.clicks >= 2) {
+      // Both click events were lost: invoke the same page handler once. All
+      // school validation/encryption/service logic remains in that handler.
+      try { window.doauthen.call(submit); } catch (_) { state.failed = true; }
+      if (state.failed) return 'submission-unconfirmed';
+      return window.__campusSubmitted ? 'submitted' : 'waiting-submit';
+    }
+    state.clicks++;
+    try {
+      if (state.clicks === 1) submit.click();
+      else submit.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+    } catch (_) { state.failed = true; }
+    if (state.failed) return 'submission-unconfirmed';
+    if (window.__campusSubmitted) return 'submitted';
+    // A second activation is allowed only if the school's handler never ran.
+    return 'waiting-submit';
+  }
+  window.__campusSubmitted = true;
+  submit.click();
+  return 'submitted';
+})()

@@ -1,0 +1,415 @@
+import Foundation
+
+enum JoinMode: String, Codable, CaseIterable, Identifiable {
+    case open, personal, enterprise
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .open: return "开放网络"; case .personal: return "Wi-Fi 密码"; case .enterprise: return "企业账号（802.1X）" }
+    }
+}
+
+enum WiredAuth: String, Codable, CaseIterable, Identifiable {
+    case web, pppoe, dot1x, client
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .web: return "网页认证"
+        case .pppoe: return "PPPoE 宽带拨号"
+        case .dot1x: return "802.1X 系统认证"
+        case .client: return "学校专用客户端"
+        }
+    }
+}
+
+struct CampusProfile: Codable, Equatable {
+    var ssid = "HNPI-STU"
+    var wiredAuth: WiredAuth = .web
+    var ethernetName = ""
+    var broadbandName = ""
+    var authenticationClient = ""
+    var isWired: Bool { ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var usesSystemAuthentication: Bool { isWired && wiredAuth != .web }
+    var usesWebPortal: Bool { portalEnabled && !usesSystemAuthentication }
+    var connectionLabel: String { isWired ? "有线 · \(wiredAuth.title)" : "Wi-Fi" }
+    func matchesNetwork(currentSSID: String?, wiredAvailable: Bool) -> Bool {
+        isWired ? wiredAvailable : currentSSID == ssid
+    }
+    var joinMode: JoinMode = .open
+    var wifiUsername = ""
+    var portalEnabled = true
+    var portalURL = "http://192.168.0.123"
+    var username = ""
+    var serviceOption = ""
+    var userSelector = ""
+    var passwordSelector = ""
+    var submitSelector = ""
+    var autoSubmit = true
+    var automatic = false
+
+    enum CodingKeys: String, CodingKey {
+        case ssid, joinMode, wifiUsername, portalEnabled, portalURL, username
+        case serviceOption, userSelector, passwordSelector, submitSelector, autoSubmit, automatic
+        case wiredAuth, ethernetName, broadbandName, authenticationClient
+    }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        ssid = try values.decodeIfPresent(String.self, forKey: .ssid) ?? "HNPI-STU"
+        wiredAuth = try values.decodeIfPresent(WiredAuth.self, forKey: .wiredAuth) ?? .web
+        ethernetName = try values.decodeIfPresent(String.self, forKey: .ethernetName) ?? ""
+        broadbandName = try values.decodeIfPresent(String.self, forKey: .broadbandName) ?? ""
+        authenticationClient = try values.decodeIfPresent(String.self, forKey: .authenticationClient) ?? ""
+        joinMode = try values.decodeIfPresent(JoinMode.self, forKey: .joinMode) ?? .open
+        wifiUsername = try values.decodeIfPresent(String.self, forKey: .wifiUsername) ?? ""
+        portalEnabled = try values.decodeIfPresent(Bool.self, forKey: .portalEnabled) ?? true
+        portalURL = try values.decodeIfPresent(String.self, forKey: .portalURL) ?? "http://192.168.0.123"
+        username = try values.decodeIfPresent(String.self, forKey: .username) ?? ""
+        serviceOption = try values.decodeIfPresent(String.self, forKey: .serviceOption) ?? ""
+        userSelector = try values.decodeIfPresent(String.self, forKey: .userSelector) ?? ""
+        passwordSelector = try values.decodeIfPresent(String.self, forKey: .passwordSelector) ?? ""
+        submitSelector = try values.decodeIfPresent(String.self, forKey: .submitSelector) ?? ""
+        autoSubmit = try values.decodeIfPresent(Bool.self, forKey: .autoSubmit) ?? true
+        automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+    }
+
+    var validPortalURL: URL? {
+        guard let url = URL(string: portalURL), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), url.host != nil,
+              url.user == nil, url.password == nil else { return nil }
+        return url
+    }
+    func validate() throws {
+        guard isWired || ssid.utf8.count <= 32 else { throw AppError.message("Wi-Fi 名称最多为 32 字节；有线模式请留空。") }
+        if !isWired && joinMode == .enterprise && wifiUsername.isEmpty { throw AppError.message("企业认证需要 Wi-Fi 用户名。") }
+        if ethernetName.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) { throw AppError.message("以太网接口名称无效。") }
+        if isWired && wiredAuth == .pppoe && (broadbandName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || broadbandName.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)) {
+            throw AppError.message("请填写 macOS 中已配置的 PPPoE 服务名称。")
+        }
+        if isWired && wiredAuth == .client && (!authenticationClient.hasPrefix("/") || !authenticationClient.hasSuffix(".app")) {
+            throw AppError.message("请选择已安装的学校认证客户端 .app 应用。")
+        }
+        if usesWebPortal && !portalURL.isEmpty && validPortalURL == nil { throw AppError.message("认证地址需要以 http:// 或 https:// 开头。") }
+    }
+}
+
+enum AppError: LocalizedError {
+    case message(String)
+    var errorDescription: String? { if case let .message(text) = self { return text }; return nil }
+}
+
+struct Secrets: Codable, Equatable {
+    var wifi = ""
+    var portal = ""
+}
+
+struct LocalConfiguration: Codable {
+    var profile: CampusProfile
+    var credentials: [String: Secrets] = [:]
+}
+
+enum LocalStore {
+    static var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CampusConnect", isDirectory: true)
+    }
+    static func load(directory: URL = directory) throws -> LocalConfiguration {
+        let file = directory.appendingPathComponent("configuration.json")
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            let legacy = UserDefaults.standard.data(forKey: "campus.profile")
+                .flatMap { try? JSONDecoder().decode(CampusProfile.self, from: $0) } ?? CampusProfile()
+            return LocalConfiguration(profile: legacy)
+        }
+        return try JSONDecoder().decode(LocalConfiguration.self, from: Data(contentsOf: file))
+    }
+    static func read(_ ssid: String, _ kind: String, directory: URL = directory) throws -> String {
+        let secrets = try load(directory: directory).credentials[ssid] ?? Secrets()
+        return kind == "wifi" ? secrets.wifi : secrets.portal
+    }
+    static func save(profile: CampusProfile, secrets: Secrets? = nil, directory: URL = directory) throws {
+        var configuration = try load(directory: directory)
+        configuration.profile = profile
+        if let secrets { configuration.credentials[profile.ssid] = secrets }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(configuration)
+        let manager = FileManager.default
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        let file = directory.appendingPathComponent("configuration.json")
+        try data.write(to: file, options: .atomic)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+    }
+}
+
+struct AutoPolicy {
+    var lastAttempt = Date.distantPast
+    func shouldJoin(enabled: Bool, target: String, current: String?, visible: [String], busy: Bool, now: Date) -> Bool {
+        enabled && !target.isEmpty && current != target && visible.contains(target) && !busy && now.timeIntervalSince(lastAttempt) >= 60
+    }
+    func shouldPrepareWired(enabled: Bool, needed: Bool, busy: Bool, now: Date) -> Bool {
+        enabled && needed && !busy && now.timeIntervalSince(lastAttempt) >= 60
+    }
+    mutating func begin(at date: Date) { lastAttempt = date }
+    mutating func reset() { lastAttempt = .distantPast }
+}
+
+enum InternetStatus: String { case online, unavailable }
+struct PortalRecovery {
+    private(set) var failures = 0
+    private(set) var attempts = 0
+    private(set) var lastAttempt = Date.distantPast
+    private(set) var state: InternetStatus = .unavailable
+    var retryDelay: TimeInterval { min(300, 60 * pow(2, Double(max(0, attempts - 1)))) }
+    mutating func observe(_ result: InternetStatus) {
+        if result == .online { reset(); state = .online }
+        else { state = result; failures = min(2, failures + 1) }
+    }
+    func shouldAuthenticate(enabled: Bool, portalEnabled: Bool, now: Date) -> Bool {
+        enabled && portalEnabled && state != .online && ((attempts == 0 && failures == 0) || failures >= 1)
+            && now.timeIntervalSince(lastAttempt) >= retryDelay
+    }
+    mutating func begin(at now: Date) { lastAttempt = now; attempts = min(4, attempts + 1) }
+    mutating func reset() { self = PortalRecovery() }
+}
+
+enum PortalFillRetry {
+    static let maxAttempts = 200
+    static let delay: TimeInterval = 0.15
+    static func shouldRetry(result: String?, scriptFailed: Bool, attempt: Int) -> Bool {
+        attempt < maxAttempts && (scriptFailed || ["waiting-ready", "waiting-submit", "waiting-agreement", "missing-fields", "missing-submit", "missing-service"].contains(result ?? ""))
+    }
+}
+
+enum PortalScript {
+    static func origin(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme), let host = url.host?.lowercased() else { return nil }
+        let port = url.port
+        let defaultPort = scheme == "https" ? 443 : 80
+        let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return "\(scheme)://\(formattedHost)\(port != nil && port != defaultPort ? ":\(port!)" : "")"
+    }
+    static func build(profile: CampusProfile, password: String, statusOnly: Bool = false) throws -> String {
+        guard let url = profile.validPortalURL, let origin = origin(url) else { throw AppError.message("请先保存认证地址。") }
+        let payload: [String: Any] = ["origin": origin, "username": profile.username, "password": password,
+                                    "serviceOption": profile.serviceOption, "userSelector": profile.userSelector, "passwordSelector": profile.passwordSelector,
+                                    "submitSelector": profile.submitSelector, "submit": profile.autoSubmit, "confirmSubmit": true, "statusOnly": statusOnly]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let json = String(decoding: data, as: UTF8.self)
+        // Credentials are supplied to the current page only after native SSID + origin checks.
+        return """
+        (() => {
+          const cfg = \(json);
+          if (location.origin !== cfg.origin) return 'wrong-origin';
+          const outcome = window.__campusSubmitAttempt?.result;
+          const successPage = location.pathname === '/eportal/success.jsp' &&
+            !!new URLSearchParams(location.search).get('userIndex');
+          if (successPage || outcome === 'success') return 'authenticated';
+          if (outcome === 'fail') return 'authentication-rejected';
+          if (cfg.statusOnly) return window.__campusSubmitted ? 'awaiting-authentication' : 'not-submitted';
+          const pending = cfg.confirmSubmit && window.__campusSubmitAttempt;
+          if (pending && pending.failed) return 'submission-unconfirmed';
+          if (window.__campusSubmitted) return 'already-submitted';
+          if (pending && pending.handlerStarted) {
+            if (pending.failed || Date.now() - pending.startedAt >= 8000) return 'submission-unconfirmed';
+            return 'waiting-submit';
+          }
+          if (document.readyState === 'loading') return 'waiting-ready';
+          const ready = window.__campusReady;
+          if (ready && (ready.failed || !ready.pageInfo || !ready.getServices)) return 'waiting-ready';
+          const visible = e => e && !e.disabled && e.getClientRects().length > 0;
+          const editable = e => e instanceof HTMLInputElement && !e.disabled && !e.readOnly;
+          let user, pass, submit, portalUser, portalPass, portalButton;
+          const tipFor = input => input === portalUser ? document.querySelector('#username_tip') :
+            input === portalPass ? document.querySelector('#pwd_tip') : null;
+          const available = input => editable(input) && (visible(input) ||
+            (portalButton && visible(tipFor(input))));
+          try {
+            // Ruijie ePortal displays readonly tips over hidden real inputs. Its login
+            // control is an image-only anchor, so text/button heuristics cannot find it.
+            portalUser = document.querySelector('#username');
+            portalPass = document.querySelector('#pwd');
+            portalButton = document.querySelector('#loginLink');
+            if (!editable(portalUser) || portalUser.type !== 'text' ||
+                !editable(portalPass) || portalPass.type !== 'password' || !portalButton) {
+              portalUser = portalPass = portalButton = null;
+            }
+            // Unknown ePortal variants retain full-load behavior; only inspected initialization is accelerated.
+            if (portalButton && !ready && document.readyState !== 'complete') return 'waiting-ready';
+            pass = cfg.passwordSelector ? document.querySelector(cfg.passwordSelector) :
+              portalPass || [...document.querySelectorAll('input[type="password"]')].find(e => editable(e) && visible(e));
+            const root = pass && pass.form ? pass.form : document;
+            user = cfg.userSelector ? document.querySelector(cfg.userSelector) : portalUser ||
+              [...root.querySelectorAll('input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])')]
+              .filter(e => editable(e) && visible(e)).find(e => /user|account|student|phone|login|学号|账号|手机/i.test([e.name,e.id,e.placeholder,e.autocomplete].join(' ')));
+            if (!user && !cfg.userSelector) user = [...root.querySelectorAll('input[type="text"],input[type="tel"],input[type="email"],input:not([type])')].find(e => editable(e) && visible(e));
+            submit = cfg.submitSelector ? document.querySelector(cfg.submitSelector) : portalButton ||
+              [...root.querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]')].filter(visible)
+                .find(e => e.type === 'submit' || /^(登录|登陆|认证|连接|login|log in|sign in|connect)(\\s*(login|登录|登陆))?$/i.test((e.innerText || e.value || '').trim()));
+          } catch (_) { return 'invalid-selector'; }
+          if (!available(user) || !available(pass)) return 'missing-fields';
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+          for (const [input, value] of [[user,cfg.username],[pass,cfg.password]]) {
+            if (!visible(input)) {
+              const tip = tipFor(input);
+              if (visible(tip)) {
+                tip.focus();
+                // Background WebViews may not deliver native focus. Invoke the school's
+                // own reveal handlers without taking OS focus or changing its DOM styles.
+                if (!visible(input) && visible(tip)) tip.dispatchEvent(new FocusEvent('focus'));
+                if (!visible(input) && visible(tip)) tip.dispatchEvent(new FocusEvent('focusin', {bubbles:true}));
+                if (!visible(input) && visible(tip)) tip.click();
+              }
+            }
+            if (!editable(input) || !visible(input)) return 'missing-fields';
+            if (!cfg.confirmSubmit || input.value !== value) {
+              setter.call(input, value);
+              input.dispatchEvent(new Event('input', {bubbles:true}));
+              input.dispatchEvent(new Event('change', {bubbles:true}));
+            }
+          }
+          const serviceName = (cfg.serviceOption || '').trim();
+          if (serviceName) {
+            const normalized = text => (text || '').trim();
+            const serviceValue = document.querySelector('#net_access_type');
+            const serviceLabel = document.querySelector('#selectDisname');
+            if (portalButton && serviceValue && serviceLabel && !(serviceValue instanceof HTMLSelectElement)) {
+              // Use the school's existing menu click handlers, including domain/operator updates.
+              // Opening the menu can lazily fetch services for the account just filled above.
+              if (normalized(serviceLabel.textContent) !== serviceName || !serviceValue.value) {
+                const opener = document.querySelector('#serviceShowHideTop');
+                const opened = window.__campusServiceMenus ||= new WeakMap();
+                if (visible(opener) && opened.get(opener) !== cfg.username) {
+                  opened.set(opener, cfg.username);
+                  opener.click();
+                }
+                const choices = [...document.querySelectorAll('#serviceShowHide [id^="bch_service_"]')]
+                  .filter(row => visible(row) && row.getAttribute('aria-disabled') !== 'true' &&
+                    normalized((row.querySelector('[id^="_service_"]') || row).textContent) === serviceName);
+                if (choices.length !== 1) return 'missing-service';
+                choices[0].click();
+                if (normalized(serviceLabel.textContent) !== serviceName || !serviceValue.value) return 'missing-service';
+              }
+            } else {
+              const root = pass.form || document;
+              const choices = [...root.querySelectorAll('select')].filter(select => visible(select) && !select.multiple)
+                .flatMap(select => [...select.options].filter(option => !option.disabled &&
+                  !(option.parentElement instanceof HTMLOptGroupElement && option.parentElement.disabled) &&
+                  normalized(option.textContent) === serviceName).map(option => ({select, option})));
+              if (choices.length !== 1) return 'missing-service';
+              const {select, option} = choices[0];
+              if (select.selectedIndex !== option.index) {
+                select.selectedIndex = option.index;
+                select.dispatchEvent(new Event('input', {bubbles:true}));
+                select.dispatchEvent(new Event('change', {bubbles:true}));
+              }
+              if (select.selectedOptions[0] !== option || select.disabled) return 'missing-service';
+            }
+          }
+          /*CAMPUS_AGREEMENTS*/
+          // School handlers can reject/reset a value; never report success or submit it.
+          if (!editable(user) || !editable(pass) || !visible(user) || !visible(pass) ||
+              user.value !== cfg.username || pass.value !== cfg.password) return 'missing-fields';
+          if (!cfg.submit) return 'filled';
+          if (!visible(submit)) return 'missing-submit';
+          if (portalButton && /doauthen/.test(submit.getAttribute('onclick') || '') &&
+              typeof window.doauthen !== 'function') return 'waiting-ready';
+          // Captchas and extra operator fields need the user's input; don't burn a login attempt.
+          if (portalButton && ['#validCode','#operatorUserId','#operatorPwd'].some(selector => {
+            const input = document.querySelector(selector);
+            return visible(input) && !input.value.trim();
+          })) return 'manual-required';
+          // WKWebView can finish filling before the page handles its first activation.
+          // Observe only the known school's own login flow; never call its API ourselves.
+          if (cfg.confirmSubmit && submit === portalButton && /doauthen/.test(submit.getAttribute('onclick') || '')) {
+            if (typeof window.AuthInterFace?.login !== 'function') return 'waiting-ready';
+            const state = window.__campusSubmitAttempt ||= {clicks:0, prepared:false, handlerStarted:false, failed:false};
+            const observe = (owner, key, flag) => {
+              if (owner[key] === state[key]) return;
+              const original = owner[key];
+              const wrapped = function(...args) {
+                if (flag === 'login') {
+                  window.__campusSubmitted = true;
+                  // Observe the school's response without replacing its request or callback.
+                  const last = args.length - 1;
+                  if (typeof args[last] === 'function') {
+                    const callback = args[last];
+                    args[last] = function(result, ...rest) {
+                      if (result?.result === 'success') state.result = 'success';
+                      else if (result?.result === 'fail') state.result = 'fail';
+                      return callback.call(this, result, ...rest);
+                    };
+                  }
+                }
+                else { state.handlerStarted = true; state.startedAt = Date.now(); }
+                try { return original.apply(this, args); }
+                catch (error) { state.failed = true; throw error; }
+              };
+              state[key] = wrapped; owner[key] = wrapped;
+            };
+            observe(window, 'doauthen', 'handler');
+            observe(window.AuthInterFace, 'login', 'login');
+            if (!state.prepared || state.button !== submit || state.user !== user || state.pass !== pass) {
+              state.prepared = true; state.button = submit; state.user = user; state.pass = pass;
+              if (document.activeElement === user || document.activeElement === pass) document.activeElement.blur();
+              submit.focus();
+              // Let blur/change handlers and layout finish before rechecking the values.
+              return 'waiting-submit';
+            }
+            if (state.clicks >= 2) {
+              // Both click events were lost: invoke the same page handler once. All
+              // school validation/encryption/service logic remains in that handler.
+              try { window.doauthen.call(submit); } catch (_) { state.failed = true; }
+              if (state.failed) return 'submission-unconfirmed';
+              return window.__campusSubmitted ? 'submitted' : 'waiting-submit';
+            }
+            state.clicks++;
+            try {
+              if (state.clicks === 1) submit.click();
+              else submit.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+            } catch (_) { state.failed = true; }
+            if (state.failed) return 'submission-unconfirmed';
+            if (window.__campusSubmitted) return 'submitted';
+            // A second activation is allowed only if the school's handler never ran.
+            return 'waiting-submit';
+          }
+          window.__campusSubmitted = true;
+          submit.click();
+          return 'submitted';
+        })()
+        """.replacingOccurrences(of: "  /*CAMPUS_AGREEMENTS*/", with: agreementScript)
+    }
+    static let agreementScript = #"""
+      // Activate required login checkboxes through school handlers.
+      // The caller has already checked network/origin and identified the login inputs.
+      {
+        const root = pass.form || document;
+        const attempted = window.__campusAgreementAttempts ||= new WeakMap();
+        const candidates = [...root.querySelectorAll('input[type="checkbox"],[role="checkbox"]')]
+          .filter(box => box instanceof HTMLInputElement ? box.type === 'checkbox' : box.getAttribute?.('role') === 'checkbox');
+        for (const box of candidates) {
+          if (box.form && box.form !== pass.form) continue;
+          const labels = [...(box.labels || [])];
+          const wrapper = box.closest('label,[role=checkbox],.checkbox,.agreement,.protocol');
+          if (wrapper && !labels.includes(wrapper)) labels.push(wrapper);
+          for (const id of (box.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+            const label = document.getElementById(id);
+            if (label) labels.push(label);
+          }
+          const text = [box.getAttribute('aria-label'), ...labels.map(label => label.textContent),
+            box.getAttribute('role') === 'checkbox' ? box.textContent : '', box.id, box.name].join(' ');
+          if (/记住|自动登录|保持登录|订阅|推广|广告|促销|营销|优惠|newsletter|marketing|remember|stay\s+signed/i.test(text)) continue;
+          const agreement = /同意|已阅读|阅读并|服务(?:使用)?协议|用户协议|隐私政策|使用条款|\bagree\b|\baccept\b|\bterms\b|\bprivacy\b/i.test(text);
+          if (!box.required && box.getAttribute('aria-required') !== 'true' && !agreement) continue;
+          if (!visible(box) && !labels.some(visible)) continue;
+          const checked = () => box instanceof HTMLInputElement ? box.checked : box.getAttribute('aria-checked') === 'true';
+          if (checked()) continue;
+          if (box.disabled || box.getAttribute('aria-disabled') === 'true') return 'agreement-required';
+          const previous = attempted.get(box);
+          if (previous) return Date.now() - previous.started < 2000 ? 'waiting-agreement' : 'agreement-required';
+          attempted.set(box, { started: Date.now() });
+          box.click();
+          if (!checked()) return 'waiting-agreement';
+        }
+      }
+    """#
+}
